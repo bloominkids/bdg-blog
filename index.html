@@ -541,6 +541,677 @@ const BRAND_SYSTEM = `あなたはパーソナルジム「BodyDesignGYM」の公
 async function callClaude(userPrompt) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': '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', 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 3000,
+      system: BRAND_SYSTEM,
+      messages: [{ role: 'user', content: userPrompt }]
+    })
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message);
+  return data.content?.[0]?.text || '';
+}
+
+function buildPrompt(theme, target, purpose, wc, stores) {
+  let storeContext = '';
+  if (stores && stores.length > 0) {
+    storeContext = `\n対象店舗（記事に自然に組み込む）：\n` + stores.map(s =>
+      `- ${s.name}（${s.area}・${s.addr}・${s.station}）`
+    ).join('\n');
+    storeContext += `\n→ 上記のエリア・駅名・地名をSEOキーワードとして記事に自然に散りばめること。`;
+  }
+
+  return `以下の条件でブログ記事を書いてください。
+
+テーマ：${theme}
+ターゲット読者：${target}
+記事の目的：${purpose}
+目標文字数：約${wc}字${storeContext}
+
+出力形式（必ずこの形式で出力）：
+TITLE: [SEOを意識した魅力的なタイトル]
+---
+[本文をHTML形式で。h2タグで見出し（3〜4つ）、pタグで段落。最後にCTAセクションを含める]`;
+}
+
+async function generateArticle(themeOverride, targetOverride, purposeOverride, wcOverride) {
+  const theme = themeOverride || document.getElementById('theme').value.trim();
+  if (!theme) { setStatus('genStatus','テーマを入力してください','error'); return null; }
+  const target = targetOverride || document.getElementById('target').value;
+  const purpose = purposeOverride || document.getElementById('purpose').value;
+  const wc = wcOverride || document.getElementById('wordcount').value;
+  const stores = getSelectedStoresInfo();
+
+  if (!themeOverride) {
+    const btn = document.getElementById('genBtn');
+    btn.disabled = true; btn.textContent = '生成中...';
+    setStatus('genStatus','AIが記事を生成しています...','info');
+    document.getElementById('previewSection').style.display = 'none';
+  }
+
+  try {
+    const text = await callClaude(buildPrompt(theme, target, purpose, wc, stores));
+    const titleMatch = text.match(/TITLE:\s*(.+)/);
+    const bodyMatch = text.match(/---\n([\s\S]+)/);
+    const title = titleMatch ? titleMatch[1].trim() : theme;
+    const body = bodyMatch ? bodyMatch[1].trim() : text;
+
+    if (!themeOverride) {
+      generatedTitle = title;
+      generatedBody = body;
+      document.getElementById('articleTitle').textContent = title;
+      document.getElementById('previewBox').innerHTML = body;
+      document.getElementById('previewSection').style.display = 'block';
+      setStatus('genStatus','生成完了！内容を確認してWordPressに投稿してください。','success');
+      const btn = document.getElementById('genBtn');
+      btn.disabled = false; btn.textContent = 'AIで記事を生成';
+    }
+    return { title, body };
+  } catch(e) {
+    if (!themeOverride) {
+      setStatus('genStatus','エラー: ' + e.message,'error');
+      const btn = document.getElementById('genBtn');
+      btn.disabled = false; btn.textContent = 'AIで記事を生成';
+    }
+    return null;
+  }
+}
+
+function copyArticle() {
+  const text = generatedTitle + '\n\n' + document.getElementById('previewBox').innerText;
+  navigator.clipboard.writeText(text).then(() => setStatus('genStatus','コピーしました！','success'));
+}
+
+async function postToWordPress(title, body, status, isoDate) {
+  const creds = getWPCreds();
+  if (!creds.url || !creds.user || !creds.pass) throw new Error('WordPress設定が未入力です（サイドバーで入力してください）');
+  const payload = { title, content: body, status };
+  if (isoDate) payload.date = isoDate;
+  if (creds.cat) payload.categories = [parseInt(creds.cat)];
+  const auth = btoa(creds.user + ':' + creds.pass);
+  const res = await fetch(creds.url + '/wp-json/wp/v2/posts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Basic ' + auth },
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(()=>({}));
+    throw new Error(err.message || 'HTTP ' + res.status);
+  }
+}
+
+document.getElementById('wpPostBtn').onclick = async () => {
+  if (!generatedTitle) return;
+  setStatus('genStatus','WordPressに投稿中...','info');
+  try {
+    const status = document.getElementById('poststatus').value;
+    const schedVal = document.getElementById('schedtime').value;
+    const isoDate = status === 'future' && schedVal ? new Date(schedVal).toISOString() : null;
+    await postToWordPress(generatedTitle, generatedBody, status, isoDate);
+    setStatus('genStatus','WordPressへの投稿が完了しました！','success');
+  } catch(e) {
+    setStatus('genStatus','投稿エラー: ' + e.message,'error');
+  }
+};
+
+async function testConnection() {
+  const creds = getWPCreds();
+  if (!creds.url || !creds.user || !creds.pass) { setStatus('settingsStatus','全項目を入力してください','error'); return; }
+  setStatus('settingsStatus','確認中...','info');
+  try {
+    const auth = btoa(creds.user + ':' + creds.pass);
+    const res = await fetch(creds.url + '/wp-json/wp/v2/posts?per_page=1', { headers: { 'Authorization': 'Basic ' + auth } });
+    if (res.ok) setStatus('settingsStatus','接続成功！','success');
+    else setStatus('settingsStatus','認証エラー (HTTP '+res.status+')','error');
+  } catch(e) {
+    setStatus('settingsStatus','接続失敗: ' + e.message,'error');
+  }
+}
+
+function buildSchedule() {
+  const themes = document.getElementById('themeList').value.trim().split('\n').filter(t=>t.trim());
+  if (!themes.length) { alert('テーマを入力してください'); return; }
+  const freq = document.getElementById('freq').value;
+  const startDate = document.getElementById('startDate').value || new Date().toISOString().split('T')[0];
+  const postTime = document.getElementById('postTime').value || '08:00';
+  const interval = freq==='daily'?1:freq==='2days'?2:7;
+  const stores = getSelectedStoresInfo();
+
+  scheduleQueue = themes.map((theme, i) => {
+    const d = new Date(startDate + 'T' + postTime);
+    d.setDate(d.getDate() + i * interval);
+    return { theme: theme.trim(), date: d, stores, status: 'pending' };
+  });
+
+  const list = document.getElementById('queueList');
+  list.innerHTML = scheduleQueue.map((item,i) => `
+    <li class="queue-item" id="qi-${i}">
+      <span>${item.theme}${item.stores ? ' <span style="font-size:11px;color:var(--accent);">['+item.stores.map(s=>s.name).join('・')+']</span>' : ''}</span>
+      <span class="q-date">${item.date.toLocaleDateString('ja-JP')} ${item.date.toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit'})}</span>
+      <span class="pill pill-wait" id="badge-${i}">待機中</span>
+    </li>`).join('');
+  document.getElementById('queueSection').style.display = 'block';
+}
+
+async function runQueue() {
+  const creds = getWPCreds();
+  if (!creds.url || !creds.user || !creds.pass) { alert('サイドバーのWordPress設定を入力してください'); return; }
+  const postStatus = document.getElementById('schedStatus').value;
+  const btn = document.getElementById('runBtn');
+  btn.disabled = true;
+  setStatus('queueStatus','処理を開始します...','info');
+
+  for (let i = 0; i < scheduleQueue.length; i++) {
+    const item = scheduleQueue[i];
+    const badge = document.getElementById('badge-'+i);
+    badge.textContent = '生成中'; badge.className = 'pill pill-run';
+    setStatus('queueStatus',`(${i+1}/${scheduleQueue.length}) "${item.theme}" を生成中...`,'info');
+    try {
+      const result = await callClaude(buildPrompt(item.theme, 'ダイエット・体型改善を目指す方', 'エリア集客（地名キーワード）', '1500', item.stores));
+      const titleMatch = result.match(/TITLE:\s*(.+)/);
+      const bodyMatch = result.match(/---\n([\s\S]+)/);
+      const title = titleMatch ? titleMatch[1].trim() : item.theme;
+      const body = bodyMatch ? bodyMatch[1].trim() : result;
+      badge.textContent = '投稿中'; 
+      const isoDate = postStatus === 'future' ? item.date.toISOString() : null;
+      await postToWordPress(title, body, postStatus, isoDate);
+      badge.textContent = '完了'; badge.className = 'pill pill-done';
+    } catch(e) {
+      badge.textContent = 'エラー'; badge.className = 'pill pill-err';
+    }
+    await new Promise(r=>setTimeout(r,1200));
+  }
+  setStatus('queueStatus','全件の処理が完了しました！','success');
+  btn.disabled = false;
+}
+
+// Defaults
+const now = new Date();
+const pad = n => String(n).padStart(2,'0');
+document.getElementById('startDate').value = now.toISOString().split('T')[0];
+document.getElementById('schedtime').value = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}T08:00`;
+</script>
+</body>
+</html>}
+.sidebar-section { display: flex; flex-direction: column; gap: 0.75rem; }
+.sidebar-label {
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 500;
+}
+.main { padding: 2rem; display: flex; flex-direction: column; gap: 1.5rem; }
+
+/* Form elements */
+label { font-size: 12px; color: var(--muted); letter-spacing: 0.05em; display: block; margin-bottom: 6px; }
+input, select, textarea {
+  width: 100%;
+  background: var(--gray);
+  border: 1px solid var(--border);
+  color: var(--white);
+  font-family: 'Noto Sans JP', sans-serif;
+  font-size: 13px;
+  font-weight: 300;
+  padding: 9px 12px;
+  border-radius: 3px;
+  outline: none;
+  transition: border-color 0.2s;
+  -webkit-appearance: none;
+}
+input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+textarea { resize: vertical; min-height: 80px; line-height: 1.6; }
+select option { background: var(--gray); }
+
+.field { display: flex; flex-direction: column; }
+.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+
+/* Buttons */
+.btn {
+  font-family: 'Noto Sans JP', sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  padding: 10px 20px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--white);
+  cursor: pointer;
+  transition: all 0.15s;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.btn:hover { background: var(--mid); }
+.btn:active { transform: scale(0.98); }
+.btn-accent {
+  background: var(--accent);
+  color: var(--black);
+  border-color: var(--accent);
+  font-weight: 700;
+}
+.btn-accent:hover { background: #aadd00; border-color: #aadd00; }
+.btn-accent:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+.btn-sm { padding: 6px 14px; font-size: 12px; }
+
+/* Tabs */
+.tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); }
+.tab {
+  font-family: 'Noto Sans JP', sans-serif;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 12px 20px;
+  cursor: pointer;
+  margin-bottom: -1px;
+  transition: all 0.15s;
+}
+.tab:hover { color: var(--white); }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+/* Cards */
+.card {
+  background: var(--gray);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1.5rem;
+}
+.card-title {
+  font-family: 'Bebas Neue', sans-serif;
+  font-size: 1rem;
+  letter-spacing: 0.1em;
+  color: var(--white);
+  margin-bottom: 1rem;
+}
+
+/* Status */
+.status {
+  font-size: 12px;
+  padding: 8px 12px;
+  border-radius: 3px;
+  display: none;
+  border-left: 3px solid;
+}
+.status.info { display: block; background: rgba(0,120,255,0.1); border-color: #0078ff; color: #60a8ff; }
+.status.success { display: block; background: rgba(0,230,118,0.1); border-color: var(--green); color: var(--green); }
+.status.error { display: block; background: rgba(255,59,59,0.1); border-color: var(--red); color: var(--red); }
+
+/* Store chips */
+.store-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.store-chip {
+  font-size: 12px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  text-align: left;
+  font-family: 'Noto Sans JP', sans-serif;
+  transition: all 0.15s;
+}
+.store-chip:hover { border-color: var(--accent); color: var(--white); }
+.store-chip.selected { border-color: var(--accent); background: rgba(200,255,0,0.08); color: var(--accent); }
+.store-chip .area-tag {
+  font-size: 9px;
+  color: var(--muted);
+  display: block;
+  margin-bottom: 2px;
+  letter-spacing: 0.05em;
+}
+.store-chip.selected .area-tag { color: rgba(200,255,0,0.6); }
+
+/* Preview */
+.preview-wrap {
+  background: var(--gray);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.preview-header {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--black);
+}
+.preview-title-text {
+  font-size: 16px;
+  font-weight: 500;
+  color: var(--white);
+  line-height: 1.5;
+}
+.preview-body {
+  padding: 1.25rem 1.5rem;
+  font-size: 13px;
+  line-height: 1.9;
+  color: #ccc;
+  max-height: 380px;
+  overflow-y: auto;
+}
+.preview-body h2 { font-size: 15px; font-weight: 700; color: var(--white); margin: 1.2rem 0 0.5rem; border-left: 3px solid var(--accent); padding-left: 10px; }
+.preview-body p { margin-bottom: 0.8rem; }
+
+/* Queue */
+.queue-list { list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.queue-item {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: var(--black);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 13px;
+}
+.queue-item .q-date { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.pill {
+  font-size: 10px;
+  padding: 3px 8px;
+  border-radius: 20px;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+}
+.pill-wait { background: rgba(255,180,0,0.15); color: #ffb400; }
+.pill-done { background: rgba(0,230,118,0.15); color: var(--green); }
+.pill-err { background: rgba(255,59,59,0.15); color: var(--red); }
+.pill-run { background: rgba(0,120,255,0.15); color: #60a8ff; }
+
+/* Divider */
+.divider { border: none; border-top: 1px solid var(--border); }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: var(--black); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+/* Hidden tab panels */
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+/* hint */
+.hint { font-size: 11px; color: var(--muted); margin-top: 5px; line-height: 1.6; }
+
+@media (max-width: 768px) {
+  .layout { grid-template-columns: 1fr; }
+  .sidebar { border-right: none; border-bottom: 1px solid var(--border); }
+  .row2, .row3 { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">Body<span>Design</span>GYM <span style="font-size:0.9rem;color:var(--muted);font-family:'Noto Sans JP',sans-serif;font-weight:300;letter-spacing:0;">Blog Generator</span></div>
+  <div class="badge">AI Powered</div>
+</header>
+
+<div class="layout">
+  <!-- Sidebar: WP Settings always visible -->
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">WordPress 接続設定</div>
+      <div class="field">
+        <label>サイトURL</label>
+        <input type="url" id="wpUrl" placeholder="https://bodydesigngym.com" value="https://bodydesigngym.com" />
+      </div>
+      <div class="field">
+        <label>ユーザー名</label>
+        <input type="text" id="wpUser" placeholder="admin" />
+      </div>
+      <div class="field">
+        <label>アプリパスワード</label>
+        <input type="password" id="wpPass" placeholder="xxxx xxxx xxxx xxxx" />
+      </div>
+      <div class="field">
+        <label>カテゴリID（任意）</label>
+        <input type="text" id="wpCat" placeholder="1" />
+      </div>
+      <button class="btn btn-sm" onclick="testConnection()">接続テスト</button>
+      <div id="settingsStatus" class="status"></div>
+      <p class="hint">WP管理画面 → ユーザー → プロフィール → アプリケーションパスワード で発行</p>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="sidebar-label">対象店舗</div>
+      <div class="store-grid" id="storeGrid"></div>
+    </div>
+  </aside>
+
+  <!-- Main -->
+  <main class="main">
+    <div class="tabs">
+      <button class="tab active" onclick="switchTab('generate')">記事を生成</button>
+      <button class="tab" onclick="switchTab('schedule')">スケジュール投稿</button>
+    </div>
+
+    <!-- Generate Tab -->
+    <div id="tab-generate" class="tab-panel active">
+      <div class="card">
+        <div class="card-title">記事設定</div>
+        <div class="field" style="margin-bottom:14px;">
+          <label>テーマ / キーワード</label>
+          <textarea id="theme" placeholder="例：パーソナルジムと大手ジムの違い、体脂肪を落とす食事管理のコツ、大和周辺でジムを探している方へ…"></textarea>
+        </div>
+        <div class="row2" style="margin-bottom:14px;">
+          <div class="field">
+            <label>ターゲット読者</label>
+            <select id="target">
+              <option>ダイエット・体型改善を目指す方</option>
+              <option>キックボクシング・格闘技に興味がある方</option>
+              <option>健康維持・体力づくりをしたい30〜50代</option>
+              <option>法人担当者（福利厚生・健康経営）</option>
+              <option>産後ダイエット・女性向け</option>
+              <option>運動初心者・ジム未経験者</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>記事の目的</label>
+            <select id="purpose">
+              <option>体験入会・見学への誘導</option>
+              <option>SEO集客・認知拡大</option>
+              <option>エリア集客（地名キーワード）</option>
+              <option>法人プラン紹介</option>
+              <option>トレーニング知識・お役立ち情報</option>
+              <option>3rd FITTキックボクシングクラス紹介</option>
+            </select>
+          </div>
+        </div>
+        <div class="row3" style="margin-bottom:14px;">
+          <div class="field">
+            <label>文字数</label>
+            <select id="wordcount">
+              <option value="800">800字（短め）</option>
+              <option value="1500" selected>1500字（標準）</option>
+              <option value="2500">2500字（詳細）</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>投稿ステータス</label>
+            <select id="poststatus">
+              <option value="draft">下書き保存</option>
+              <option value="publish">即時公開</option>
+              <option value="future">予約投稿</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>投稿日時（予約時）</label>
+            <input type="datetime-local" id="schedtime" />
+          </div>
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;">
+          <button class="btn btn-accent" id="genBtn" onclick="generateArticle()">AIで記事を生成</button>
+        </div>
+        <div id="genStatus" class="status" style="margin-top:12px;"></div>
+      </div>
+
+      <div id="previewSection" style="display:none;">
+        <div class="preview-wrap">
+          <div class="preview-header">
+            <div id="articleTitle" class="preview-title-text"></div>
+            <div style="display:flex;gap:8px;flex-shrink:0;margin-left:16px;">
+              <button class="btn btn-sm" onclick="copyArticle()">コピー</button>
+              <button class="btn btn-sm btn-accent" id="wpPostBtn">WordPressに投稿</button>
+            </div>
+          </div>
+          <div class="preview-body" id="previewBox"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Schedule Tab -->
+    <div id="tab-schedule" class="tab-panel">
+      <div class="card">
+        <div class="card-title">スケジュール設定</div>
+        <div class="row2" style="margin-bottom:14px;">
+          <div class="field">
+            <label>テーマリスト（改行区切り）</label>
+            <textarea id="themeList" rows="8" placeholder="パーソナルジムと大手ジムの違い&#10;体脂肪率を下げる食事の基本&#10;大和周辺でパーソナルジムを探す方へ&#10;キックボクシングで消費するカロリー&#10;法人ウェルネスプランとは&#10;産後ダイエットにパーソナルが向く理由&#10;筋トレ初心者が最初にやること&#10;3rd FITTキックボクシング紹介"></textarea>
+          </div>
+          <div>
+            <div class="field" style="margin-bottom:12px;">
+              <label>投稿頻度</label>
+              <select id="freq">
+                <option value="daily">毎日</option>
+                <option value="2days" selected>2日に1回</option>
+                <option value="weekly">週1回</option>
+              </select>
+            </div>
+            <div class="field" style="margin-bottom:12px;">
+              <label>開始日</label>
+              <input type="date" id="startDate" />
+            </div>
+            <div class="field" style="margin-bottom:12px;">
+              <label>投稿時刻</label>
+              <input type="time" id="postTime" value="08:00" />
+            </div>
+            <div class="field">
+              <label>投稿ステータス</label>
+              <select id="schedStatus">
+                <option value="future">予約投稿</option>
+                <option value="draft">下書き保存</option>
+                <option value="publish">即時公開</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <button class="btn btn-accent" onclick="buildSchedule()">スケジュールを組む</button>
+      </div>
+
+      <div id="queueSection" style="display:none;">
+        <div class="card">
+          <div class="card-title">投稿キュー</div>
+          <ul class="queue-list" id="queueList"></ul>
+          <div style="margin-top:14px;display:flex;gap:10px;align-items:center;">
+            <button class="btn btn-accent btn-sm" onclick="runQueue()" id="runBtn">一括生成してWordPressに投稿</button>
+          </div>
+          <div id="queueStatus" class="status" style="margin-top:12px;"></div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+const STORES = [
+  { id:'yamato', name:'大和店', area:'神奈川', addr:'大和市中央3-8-26', station:'大和駅徒歩5分', url:'https://bodydesigngym.com/gym/yamato/' },
+  { id:'chuo-rinkan', name:'中央林間店', area:'神奈川', addr:'大和市中央林間4-17-6', station:'中央林間駅徒歩2分', url:'https://bodydesigngym.com/gym/chuo-rinkan/' },
+  { id:'futamatagawa', name:'二俣川店', area:'神奈川', addr:'横浜市旭区本村町108-7', station:'二俣川駅', url:'https://bodydesigngym.com/gym/futamatagawa/' },
+  { id:'shonandai', name:'湘南台店', area:'神奈川', addr:'藤沢市湘南台2-1-1', station:'湘南台駅', url:'https://bodydesigngym.com/gym/shonandai/' },
+  { id:'ebina', name:'海老名店', area:'神奈川', addr:'海老名市中央2-9-50', station:'海老名駅', url:'https://bodydesigngym.com/gym/ebina/' },
+  { id:'chigasaki', name:'茅ヶ崎店', area:'神奈川', addr:'茅ヶ崎市十間坂1-3-36', station:'茅ヶ崎駅', url:'https://bodydesigngym.com/gym/chigasaki/' },
+  { id:'minamimachida', name:'南町田店', area:'東京', addr:'町田市鶴間8-6-8', station:'南町田グランベリーパーク駅', url:'https://bodydesigngym.com/gym/minamimachida/' },
+];
+
+let selectedStores = [];
+let generatedTitle = '';
+let generatedBody = '';
+let scheduleQueue = [];
+
+// Render store chips
+function renderStores() {
+  const grid = document.getElementById('storeGrid');
+  grid.innerHTML = STORES.map(s => `
+    <button class="store-chip" id="chip-${s.id}" onclick="toggleStore('${s.id}')">
+      <span class="area-tag">${s.area}</span>
+      ${s.name}
+    </button>`).join('');
+}
+renderStores();
+
+function toggleStore(id) {
+  const idx = selectedStores.indexOf(id);
+  if (idx === -1) selectedStores.push(id);
+  else selectedStores.splice(idx, 1);
+  STORES.forEach(s => {
+    document.getElementById('chip-'+s.id).classList.toggle('selected', selectedStores.includes(s.id));
+  });
+}
+
+function getSelectedStoresInfo() {
+  if (!selectedStores.length) return null;
+  return STORES.filter(s => selectedStores.includes(s.id));
+}
+
+function switchTab(tab) {
+  ['generate','schedule'].forEach(t => {
+    document.getElementById('tab-'+t).classList.toggle('active', t===tab);
+  });
+  document.querySelectorAll('.tab').forEach((el,i) => {
+    el.classList.toggle('active', ['generate','schedule'][i]===tab);
+  });
+}
+
+function setStatus(id, msg, type) {
+  const el = document.getElementById(id);
+  el.textContent = msg;
+  el.className = 'status ' + type;
+}
+
+function getWPCreds() {
+  return {
+    url: document.getElementById('wpUrl').value.trim().replace(/\/$/,''),
+    user: document.getElementById('wpUser').value.trim(),
+    pass: document.getElementById('wpPass').value.trim(),
+    cat: document.getElementById('wpCat').value.trim()
+  };
+}
+
+const BRAND_SYSTEM = `あなたはパーソナルジム「BodyDesignGYM」の公式ブログライターです。
+
+ブランド概要：
+- パーソナルトレーニングジム（完全個室・マンツーマン指導）
+- キックボクシングブランド「3rd FITT」を南町田店に併設
+- ダイエット・体型改善・健康維持・ストレス解消を総合的にサポート
+- 法人向けウェルネスプラン（社員向け法人契約）も提供
+- 手ぶらOK、トレーニングウエア・タオル・シャワー・アメニティ無料貸出
+- 全店舗に更衣室・シャワー完備
+- 営業時間：09:00〜23:00
+- 初回カウンセリング・体験トレーニング無料
+- 公式LINE: @209cnzsy
+- 「上質な大人のためのパーソナルジム」というブランドコンセプト
+
+店舗：大和店（神奈川）、中央林間店（神奈川）、二俣川店（横浜）、湘南台店（藤沢）、海老名店（神奈川）、茅ヶ崎店（神奈川）、南町田店（東京町田）
+
+ライティング方針：
+- 親しみやすく品のあるトーン（「上質な大人のため」のイメージを保つ）
+- 具体的な数値・期間・効果を交えて説得力を出す（例：2〜3週間で変化を実感）
+- エリア名・駅名・地名を自然にちりばめてSEO効果を高める
+- 最後に自然な形でBodyDesignGYMへの無料体験・問い合わせCTAを入れる
+- 読者が「行ってみたい」と思えるような具体的な体験イメージを書く`;
+
+async function callClaude(userPrompt) {
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       model: 'claude-sonnet-4-20250514',
